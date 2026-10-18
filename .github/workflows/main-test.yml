@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'App repo commit SHA to test (blank = current main HEAD; used for red-tree replay evidence)'
+        description: 'App repo commit SHA to test, full 40 chars (blank = current main HEAD; short prefixes get resolved as branch/tag names and the fetch fails)'
         required: false
         default: ''
       details:
