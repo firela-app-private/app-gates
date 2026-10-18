@@ -28,8 +28,9 @@ on:
         type: boolean
         default: false
   schedule:
-    # Off the hour-peak minute to dodge schedule congestion delays.
-    - cron: '23 */2 * * *'
+    # 15-min cadence, offset off the quarter-hour peaks (:00/:15/:30/:45 are
+    # congestion hotspots for scheduled runs).
+    - cron: '7-59/15 * * * *'
 
 # No concurrency group: GitHub collapses same-group pending queues to the
 # newest entry (queued runs get cancelled, not stacked) — flooding the queue
