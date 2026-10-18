@@ -1,0 +1,560 @@
+name: app-gates
+
+# Runs a suite of gate checks for pull requests in fire-la/firela-app-private
+# and posts each verdict back to the PR head SHA as a check run via the Checks
+# API. Check-run writes are GitHub-App-only (fine-grained PATs lost
+# Checks:write in 2024); auth goes through actions/create-github-app-token with
+# per-token narrowing.
+#
+# Discovery is pull-based: open PRs whose head SHAs lack a complete set of
+# verdicts are picked up oldest-first, either on the bi-hourly schedule or a
+# manual workflow_dispatch (optionally with a PR number for the fast lane).
+#
+# Gate shells below mirror the source workflows in the target repo; re-sync
+# them when the source changes. Gate check-run names use a relay- prefix:
+# gh pr checks dedupes external check runs by name alone, so names must stay
+# distinct both internally and from anything Actions still posts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR number in fire-la/firela-app-private (blank = poll oldest open)'
+        required: false
+        default: ''
+      force:
+        description: 'Re-run even when verdicts are already complete (red-path testing)'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Off the hour-peak minute to dodge schedule congestion delays.
+    - cron: '23 */2 * * *'
+
+# No concurrency group: GitHub collapses same-group pending queues to the
+# newest entry (queued runs get cancelled, not stacked) — flooding the queue
+# to drain a backlog is structurally impossible under a group. Double
+# triggers from any external source are absorbed by the verdict-completeness
+# dedup in the select step; manual parallel drains use explicit pr-number
+# dispatches so parallel starters don't collide on the same oldest-incomplete
+# pick.
+
+permissions: {} # relay repo needs no API scope of its own; all egress auth is App-token
+
+env:
+  APP_REPO: fire-la/firela-app-private
+  FLUTTER_VERSION: '3.44.8'
+  # Check-run names double as the dedup/completeness keys. 8 gates.
+  GATES: relay-a11y-gate relay-no-chinese relay-no-english-ui-literals relay-no-hardcoded-color relay-no-legacy-icons relay-analyze-sanitizer relay-pr-analyze relay-pr-test
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75 # grep legs seconds; pr-test alone ~10-25 min on 2 vCPU
+    steps:
+      - name: Mint app token (fire-la/firela-app-private, narrowed)
+        id: tok
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: fire-la
+          repositories: firela-app-private
+          permission-contents: read
+          permission-pull-requests: read
+          permission-checks: write
+          permission-issues: write
+
+      - name: Select PR (dispatch input, else poll oldest incomplete)
+        id: select
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+          APP_SLUG: ${{ steps.tok.outputs.app-slug }}
+          PR_IN: ${{ inputs.pr }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/relay"
+          STATE="$RUNNER_TEMP/relay"
+          cat > "$STATE/relay-lib.sh" <<'LIB'
+          # shared helpers, sourced by later steps (RUNNER_TEMP survives checkout)
+          STATE_DIR="$RUNNER_TEMP/relay"
+          app_api() { gh api --hostname github.com "$@"; }
+          check_ids() { cat "$STATE_DIR/checks.tsv" 2>/dev/null; }
+          id_of() { awk -F'\t' -v n="$1" '$1==n{print $2}' "$STATE_DIR/checks.tsv"; }
+          create_check() { # <gate> <sha> -> echoes check-run id
+            jq -n --arg n "$1" --arg sha "$2" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{name:$n, head_sha:$sha, status:"in_progress", started_at:$t,
+                output:{title:("relay: "+$n), summary:"gate running"}}' \
+              | gh api --method POST "repos/$APP_REPO/check-runs" --input - --jq .id
+          }
+          finish_check() { # <gate> <conclusion> <summary-text>
+            local id; id="$(id_of "$1")"
+            local sum; sum="$(printf '%s' "$3" | head -c 50000 | head -40)"
+            jq -n --arg c "$2" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg title "$1" --arg sum "$sum" \
+              '{status:"completed", conclusion:$c, completed_at:$t,
+                output:{title:$title, summary:$sum}}' \
+              | gh api --method PATCH "repos/$APP_REPO/check-runs/$id" --input - >/dev/null
+          }
+          record_rc() { echo "$1=$2" >> "$STATE_DIR/results.env"; }
+          LIB
+          source "$STATE/relay-lib.sh" # defines STATE_DIR + create_check for the rest of this step
+
+          complete_p() { # <json of one PR> -> 0 when all 8 gates concluded on head sha
+            local sha
+            sha="$(printf '%s' "$1" | jq -r .head.sha)"
+            gh api --paginate "repos/$APP_REPO/commits/$sha/check-runs" \
+              | jq -sr --arg slug "$APP_SLUG" \
+                  '([.[] | .check_runs[]? // empty | select(.app.slug == $slug and .status == "completed") | .name]) as $done
+                   | ["relay-a11y-gate","relay-no-chinese","relay-no-english-ui-literals","relay-no-hardcoded-color","relay-no-legacy-icons","relay-analyze-sanitizer","relay-pr-analyze","relay-pr-test"] as $want
+                   | if ([ $want[] | select(. as $w | ($done | index($w)) | not) ] | length) == 0 then "complete" else "incomplete" end'
+          }
+
+          pr_json=""
+          if [ -n "$PR_IN" ]; then
+            pr_json="$(gh api "repos/$APP_REPO/pulls/$PR_IN")"
+          else
+            # oldest open first — backlog drains FIFO
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              if [ "$(complete_p "$line")" = "incomplete" ]; then pr_json="$line"; break; fi
+            done < <(gh api --paginate "repos/$APP_REPO/pulls?state=open&sort=created&direction=asc&per_page=50" --jq '.[] | @json')
+          fi
+
+          if [ -z "$pr_json" ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"; echo "nothing to relay"; exit 0
+          fi
+          SHA="$(printf '%s' "$pr_json" | jq -r .head.sha)"
+          # dispatch honors dedup too unless force (acceptance: second run must skip)
+          if [ "$FORCE" = "0" ] && [ "$(complete_p "$pr_json")" = "complete" ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"; echo "verdicts already complete (use force to re-run)"; exit 0
+          fi
+          # overlap guard (no concurrency group): if another run is
+          # mid-flight on this same SHA, yield — double-running the suite burns
+          # ~25 min of runner time and interleaves duplicate check runs. A check run
+          # in_progress older than 80 min (> 75-min job timeout + margin) is a
+          # zombie from a dead run: treat as absent so the poll self-heals it.
+          LIVE=$(gh api --paginate "repos/$APP_REPO/commits/$SHA/check-runs" \
+            | jq -sr --arg slug "$APP_SLUG" --argjson cutoff "$(date -u -d '-80 minutes' +%s)" \
+                '[.[] | .check_runs[]? // empty
+                  | select(.app.slug == $slug and .status == "in_progress")
+                  | select((.started_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) > $cutoff)]
+                 | length')
+          if [ "$FORCE" != "1" ] && [ "$LIVE" -gt 0 ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"; echo "another relay run is mid-flight on $SHA, yielding"; exit 0
+          fi
+
+          NUMBER="$(printf '%s' "$pr_json" | jq -r .number)"
+          BASE_REF="$(printf '%s' "$pr_json" | jq -r .base.ref)"
+          # merge ref only materializes for mergeable PRs (conflicted PRs get
+          # no refs/pull/N/merge); .mergeable is tri-state and null while
+          # GitHub computes — retry once, then fall back to the branch tree.
+          MERGEABLE="$(printf '%s' "$pr_json" | jq -r .mergeable)"
+          if [ "$MERGEABLE" = "null" ]; then
+            sleep 5
+            MERGEABLE="$(gh api "repos/$APP_REPO/pulls/$NUMBER" | jq -r .mergeable)"
+          fi
+          if [ "$MERGEABLE" = "true" ]; then
+            CHECKOUT_REF="refs/pull/$NUMBER/merge"
+          else
+            CHECKOUT_REF="$SHA"
+          fi
+          {
+            echo "number=$NUMBER"
+            echo "sha=$SHA"
+            echo "base=$BASE_REF"
+            echo "ref=$CHECKOUT_REF"
+          } >> "$GITHUB_OUTPUT"
+          : > "$STATE_DIR/results.env"
+          : > "$STATE_DIR/checks.tsv"
+          for g in $GATES; do
+            id="$(create_check "$g" "$SHA")"
+            printf '%s\t%s\n' "$g" "$id" >> "$STATE_DIR/checks.tsv"
+          done
+          echo "pre-registered 8 in_progress check runs on $SHA (PR #$NUMBER, base $BASE_REF)"
+          # fail-closed: if the job dies mid-run, un-concluded gates stay
+          # pending -> downstream consumers park instead of reading a false green.
+
+      - name: Checkout PR merge ref
+        if: steps.select.outputs.skip != '1'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          # merge ref = original semantics (pull_request events check out the
+          # merged tree): base-side fixes (e.g. a11y baseline updates) apply to
+          # branch trees without every PR rebasing first. select() falls back
+          # to the head SHA for conflicted PRs (no merge ref exists there).
+          ref: ${{ steps.select.outputs.ref }}
+          token: ${{ steps.tok.outputs.token }}
+          fetch-depth: 0 # diff-based gates walk origin/<base>...HEAD
+
+      - name: Fast-forward tree to current base (stale merge-ref fix)
+        if: steps.select.outputs.skip != '1'
+        env:
+          BASE_REF: ${{ steps.select.outputs.base }}
+        run: |
+          set -euo pipefail
+          : "${BASE_REF:?select.outputs.base is empty}"
+          # refs/pull/N/merge is only rebuilt on PR pushes: old PRs carry a
+          # stale merge tree judged against an outdated base (e.g. the a11y
+          # baseline debt registry living on main). Merging the current base
+          # in reproduces GitHub's "update branch" tree WITHOUT touching the
+          # PR branch. On conflict: abort and gate the clean
+          # stale tree (previous behavior); if abort cannot restore a clean
+          # tree, fail loudly — gating a conflicted tree produces garbage.
+          git config user.name "relay-bot"
+          git config user.email "relay-bot@users.noreply.github.com"
+          if git merge "origin/$BASE_REF" --no-edit >/tmp/relay-merge.log 2>&1; then
+            echo "base merged in: $(git log --oneline -1)"
+          else
+            echo "merge with current base conflicted — gating checked-out tree instead"
+            tail -3 /tmp/relay-merge.log || true
+            git merge --abort
+            # cleanliness FIRST, overlay AFTER — the overlay intentionally
+            # dirties the tree, so a guard placed after it would always fire.
+            if [ -e "$(git rev-parse --git-dir)/MERGE_HEAD" ] || [ -n "$(git status --porcelain)" ]; then
+              echo "::error::tree not clean after merge abort — refusing to gate a conflicted tree"
+              exit 1
+            fi
+            # conflicted fallback carries the branch's STALE debt registry —
+            # whole-tree gates would phantom-red on already-baselined debt
+            # (observed: a11y phantom-reds baselined files on stale trees). A
+            # conflicted branch must merge/rebase before landing anyway, at
+            # which point it inherits exactly this registry — so overlay the
+            # current base's registry now. Loud on failure (file missing from
+            # base would leave the phantom-red condition silently in place).
+            git checkout "origin/$BASE_REF" -- .github/a11y-gesture-detector-baseline.txt
+          fi
+
+      # ---- fast gates (no SDK) ------------------------------------------------
+      # Each leg: run the VERBATIM gate block in a subshell (its `exit 1` must
+      # not kill the step), then PATCH the check run and record rc. A gate step
+      # never fails the job itself; the summary step decides.
+
+      - name: gate a11y-gate
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          rc=0
+          (
+          set -euo pipefail
+          baseline_file=.github/a11y-gesture-detector-baseline.txt
+          if [ ! -f "$baseline_file" ]; then
+            echo "::error file=$baseline_file::A11y baseline missing. Commit it (see IGN-294 deliverable 4a) before this gate runs."
+            exit 1
+          fi
+          current=$(grep -rlE "GestureDetector\(|InkWell\(|InkResponse\(|RawGestureDetector\(" lib --include="*.dart" \
+              | sort || true)
+          baseline=$(sort "$baseline_file" | grep -v '^$' || true)
+          new=$(comm -13 <(printf '%s\n' "$baseline") <(printf '%s\n' "$current"))
+          if [ -n "$new" ]; then
+            echo "::error::New bare tap-target widget (GestureDetector/InkWell/InkResponse/RawGestureDetector). Business/pages layers: use Tappable (IGN-294). lib/core/components/: wrap in Semantics (Refs #65)."
+            echo "$new"
+            echo "Renamed/moved a baselined file? Update $baseline_file (drop old path, add new). Genuinely new? Business/pages: use Tappable (IGN-294); lib/core/components/: wrap in Semantics (Refs #65)."
+            exit 1
+          fi
+          ) > "$RUNNER_TEMP/relay/a11y.log" 2>&1 || rc=$?
+          finish_check relay-a11y-gate "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/a11y.log")"
+          record_rc a11y "$rc"; exit 0
+
+      - name: gate no-chinese
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+          EVENT_NAME: pull_request
+          BASE_REF: ${{ steps.select.outputs.base }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          rc=0
+          (
+          set -euo pipefail
+          BASE="origin/$BASE_REF"
+          FILES=$(git diff "$BASE...HEAD" --name-only --diff-filter=ACM \
+            | grep -E '^lib/.*\.dart$' \
+            | grep -vE '^lib/(generated|api/generated)/' || true)
+          if [ -z "$FILES" ]; then
+            echo "✅ No hand-written Dart changes."
+            exit 0
+          fi
+          ADDED=$(git diff "$BASE...HEAD" -- $FILES | grep -E '^\+[^+]' || true)
+          if printf '%s\n' "$ADDED" | grep -qP '[\x{4e00}-\x{9fff}]'; then
+            echo "::error::New Chinese characters detected in Dart source additions."
+            echo "User-visible strings → lib/l10n/*.arb (l10n keys); logger messages and comments must be English."
+            echo "Allowed zones: lib/l10n/*.arb, *.md, lib/generated, lib/api/generated."
+            echo "--- offending added lines ---"
+            printf '%s\n' "$ADDED" | grep -nP '[\x{4e00}-\x{9fff}]' | head -30
+            exit 1
+          fi
+          echo "✅ No new Chinese characters in Dart additions."
+          ) > "$RUNNER_TEMP/relay/no-chinese.log" 2>&1 || rc=$?
+          finish_check relay-no-chinese "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/no-chinese.log")"
+          record_rc no_chinese "$rc"; exit 0
+
+      - name: gate no-english-ui-literals
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+          EVENT_NAME: pull_request
+          BASE_REF: ${{ steps.select.outputs.base }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          rc=0
+          (
+          set -euo pipefail
+          BASE="origin/$BASE_REF"
+          FILES=$(git diff "$BASE...HEAD" --name-only --diff-filter=ACM \
+            | grep -E '^lib/.*\.dart$' \
+            | grep -vE '^lib/(generated|api/generated|core/design_tokens|l10n)/' \
+            | grep -vE '^lib/core/constants/iso_currencies\.dart$|^lib/core/router/route_names\.dart$' \
+            || true)
+          if [ -z "$FILES" ]; then
+            echo "✅ No hand-written Dart changes."
+            exit 0
+          fi
+          ADDED=$(git diff "$BASE...HEAD" -- $FILES | grep -E '^\+[^+]' || true)
+          HITS=$(printf '%s\n' "$ADDED" | perl -CSD -e '
+            while (<STDIN>) {
+              chomp;
+              while (m{(Text\s*\(\s*|\b(?:title|label|labelText|hint|hintText|helperText|placeholder|subtitle|tooltip|semanticLabel|counterText|prefixText|suffixText|description|caption|header|badge|chip|primaryLabel|secondaryLabel)\s*:\s*)[\047\042]([A-Za-z][^\047\042]{1,80})[\047\042]}g) {
+                my $s = $2;
+                next if $s =~ /^FIREla$/;
+                next if $s =~ /^[A-Z0-9_]+$/;
+                next if $s =~ /^[a-z0-9_]+$/;
+                next unless ($s =~ / / || $s =~ /\b[A-Z][a-z]+/);
+                print "$_\n";
+              }
+            }
+          ')
+          if [ -n "$HITS" ]; then
+            echo "::error::Hardcoded English UI literals detected in Dart additions."
+            echo "User-visible strings must go through lib/l10n/*.arb (AppLocalizations.of(context)!.xxx)."
+            echo "Excluded by design: all-uppercase enums, snake_case identifiers, brand 'FIREla', technical values."
+            echo "--- offending added lines ---"
+            printf '%s\n' "$HITS" | head -30
+            exit 1
+          fi
+          echo "✅ No hardcoded English UI literals in Dart additions."
+          ) > "$RUNNER_TEMP/relay/no-english.log" 2>&1 || rc=$?
+          finish_check relay-no-english-ui-literals "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/no-english.log")"
+          record_rc no_english "$rc"; exit 0
+
+      - name: gate no-hardcoded-color
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+          EVENT_NAME: pull_request
+          BASE_REF: ${{ steps.select.outputs.base }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          rc=0
+          (
+          set -euo pipefail
+          BASE="origin/$BASE_REF"
+          FILES=$(git diff "$BASE...HEAD" --name-only --diff-filter=ACM \
+            | grep -E '^lib/.*\.dart$' \
+            | grep -vE '^lib/(generated|api/generated|core/design_tokens)/' || true)
+          if [ -z "$FILES" ]; then
+            echo "✅ No hand-written Dart changes."
+            exit 0
+          fi
+          ADDED=$(git diff "$BASE...HEAD" -- $FILES | grep -E '^\+[^+]' || true)
+          if printf '%s\n' "$ADDED" | grep -qE 'Color\(0x[0-9A-Fa-f]{8}\)'; then
+            echo "::error::Hardcoded color hex detected in Dart source additions."
+            echo "Use TokenColors.* / ThemeTokens.of(context).* / colorScheme.* instead."
+            echo "lib/core/design_tokens/ is the only allowed color definition site (see CLAUDE.md 颜色系统规范)."
+            echo "--- offending added lines ---"
+            printf '%s\n' "$ADDED" | grep -nE 'Color\(0x[0-9A-Fa-f]{8}\)' | head -30
+            exit 1
+          fi
+          echo "✅ No hardcoded color hex in Dart additions."
+          ) > "$RUNNER_TEMP/relay/no-color.log" 2>&1 || rc=$?
+          finish_check relay-no-hardcoded-color "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/no-color.log")"
+          record_rc no_color "$rc"; exit 0
+
+      - name: gate no-legacy-icons
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+          EVENT_NAME: pull_request
+          BASE_REF: ${{ steps.select.outputs.base }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          rc=0
+          (
+          set -euo pipefail
+          BASE="origin/$BASE_REF"
+          FILES=$(git diff "$BASE...HEAD" --name-only --diff-filter=ACM \
+            | grep -E '^lib/.*\.dart$' \
+            | grep -vE '^lib/(generated|api/generated)/' \
+            | grep -vE '^lib/core/icons/app_icons\.dart$' || true)
+          if [ -z "$FILES" ]; then
+            echo "✅ No hand-written Dart changes."
+            exit 0
+          fi
+          if grep -nP '(?<!\w)Icons\.' $FILES; then
+            echo "::error::Legacy Material Icons (Icons.*) detected. Use AppIcons.* from lib/core/icons/app_icons.dart (Lucide icon system, lucide.dev)."
+            exit 1
+          fi
+          echo "✅ No legacy Icons.* in Dart source."
+          ) > "$RUNNER_TEMP/relay/no-icons.log" 2>&1 || rc=$?
+          finish_check relay-no-legacy-icons "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/no-icons.log")"
+          record_rc no_icons "$rc"; exit 0
+
+      # ---- SDK legs (one Flutter setup + one pub get shared) ------------------
+
+      - name: Setup Flutter (shared by SDK legs)
+        if: steps.select.outputs.skip != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: gate pr-analyze — ref guard + pub get
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          rc=0
+          (
+          set -euo pipefail
+          ref="$(sed -n '/^  firela_api:/,/^  [a-z]/p' pubspec.yaml | sed -n 's/^ *ref: *//p' | head -1)"
+          if ! [[ "$ref" =~ ^([0-9a-f]{40}|api-types/[0-9a-f]{8})$ ]]; then
+            echo "::error::firela_api ref must be an immutable commit sha (or api-types/<sha8> tag), got: '${ref}' — branch refs allow mid-build dependency swaps (#400)"
+            exit 1
+          fi
+          echo "firela_api pin OK: ${ref:0:12}…"
+          flutter pub get
+          dart format --output=none --set-exit-if-changed $(git ls-files "*.dart")
+          flutter analyze --fatal-infos
+          matches=$(grep -rn --include="*.md" "package:firela/" . \
+              | grep -vE "package:firela_(app|api)/" \
+              | grep -v "CLAUDE.md:" \
+              | grep -v "/\.autodigest/" || true)
+          if [ -n "$matches" ]; then
+            echo "::error::Documents reference non-existent package 'firela'. Use 'package:firela_app/' (app) or 'package:firela_api/' (generated)."
+            echo "$matches"
+            exit 1
+          fi
+          ) > "$RUNNER_TEMP/relay/pr-analyze.log" 2>&1 || rc=$?
+          finish_check relay-pr-analyze "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/pr-analyze.log" | tail -c 20000)"
+          record_rc pr_analyze "$rc"; exit 0
+
+      - name: gate analyze-sanitizer
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          rc=0
+          (
+          set -euo pipefail
+          dart analyze lib/api/ --fatal-infos
+          ) > "$RUNNER_TEMP/relay/sanitizer.log" 2>&1 || rc=$?
+          finish_check relay-analyze-sanitizer "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/sanitizer.log")"
+          record_rc sanitizer "$rc"; exit 0
+
+      - name: gate pr-test
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          rc=0
+          (
+          set -euo pipefail
+          status=0
+          flutter test --coverage --reporter=json > test-results.json || status=$?
+          python3 - <<'PYEOF'
+          import json
+          names, failed, done = {}, [], 0
+          for line in open('test-results.json'):
+              try:
+                  e = json.loads(line)
+              except json.JSONDecodeError:
+                  continue  # truncated tail if flutter crashed mid-stream
+              if e.get('type') == 'testStart':
+                  names[e['test']['id']] = e['test']['name']
+              elif e.get('type') == 'testDone':
+                  done += 1
+                  if e.get('result') == 'failure':
+                      failed.append(names.get(e['testID'], e['testID']))
+          print(f"{done} tests, {len(failed)} failed")
+          for n in failed:
+              print(f"  FAIL {n}")
+          PYEOF
+          exit $status
+          ) > "$RUNNER_TEMP/relay/pr-test.log" 2>&1 || rc=$?
+          finish_check relay-pr-test "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/pr-test.log" | tail -c 20000)"
+          record_rc pr_test "$rc"; exit 0
+
+      # ---- forwarder leg (poll-based port of forward-parser-request.yml) ------
+      # The source workflow triggers on issue events; this repo instead scans
+      # recent new-parser issues lacking the "Request Forwarded" marker
+      # comment. Non-fatal: if the fire-zu install is missing this leg logs
+      # and moves on.
+
+      - name: Mint app token (fire-zu/firela-vlt, narrowed)
+        id: tokvlt
+        if: always() # forwarder scans on every fire, no-op polls included
+        continue-on-error: true # R5: fire-zu install missing must never fail the run
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: fire-zu
+          repositories: firela-vlt
+          permission-contents: write
+
+      - name: Forward new-parser issues to IGN
+        if: always() && steps.tokvlt.outputs.token != ''
+        continue-on-error: true # R5: forwarder is cut-able, never blocks gates
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+          VLT_TOKEN: ${{ steps.tokvlt.outputs.token }}
+        run: |
+          set -euo pipefail
+          for num in $(gh api "repos/fire-la/firela-app-private/issues?labels=new-parser&state=open&sort=created&direction=desc&per_page=10" --jq '.[].number'); do
+            if gh api "repos/fire-la/firela-app-private/issues/$num/comments" \
+                 --jq 'any(.[]; (.body // "") | contains("Request Forwarded"))' | grep -q true; then
+              continue
+            fi
+            body="$(gh api "repos/fire-la/firela-app-private/issues/$num" --jq .body)"
+            body_b64="$(printf '%s\n' "$body" | base64 -w 0)"
+            jq -n --arg n "$num" --arg b "$body_b64" \
+              '{event_type:"external_parser_request",
+                client_payload:{issue_number:$n, source_repo:"fire-la/firela-app", issue_body_b64:$b}}' \
+              | GH_TOKEN="$VLT_TOKEN" gh api --method POST repos/fire-zu/firela-vlt/dispatches --input -
+            gh issue comment "$num" -R fire-la/firela-app-private --body "✅ **Request Forwarded**
+
+          Your parser request has been forwarded to IGN for processing.
+
+          **What happens next:**
+          1. Our system will validate your submission
+          2. PII detection will be performed
+          3. AI will generate the parser
+          4. A pull request will be created
+
+          You will receive updates on this issue within 24 hours.
+
+          Track progress: [IGN Actions](https://github.com/fire-zu/firela-vlt/actions)"
+            echo "forwarded issue #$num"
+          done
+
+      - name: Summary (job verdict)
+        if: steps.select.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
+        run: |
+          source "$RUNNER_TEMP/relay/relay-lib.sh"
+          fails=0
+          while IFS='=' read -r name rc; do
+            [ -n "$name" ] || continue
+            echo "$name rc=$rc"
+            [ "$rc" -ne 0 ] && fails=$((fails+1)) || true
+          done < "$STATE_DIR/results.env"
+          echo "gates failed: $fails / $(wc -l < "$STATE_DIR/results.env" | tr -d ' ')"
+          exit "$fails"
