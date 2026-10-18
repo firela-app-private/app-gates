@@ -89,10 +89,11 @@ jobs:
           app_api() { gh api --hostname github.com "$@"; }
           check_ids() { cat "$STATE_DIR/checks.tsv" 2>/dev/null; }
           id_of() { awk -F'\t' -v n="$1" '$1==n{print $2}' "$STATE_DIR/checks.tsv"; }
-          create_check() { # <gate> <sha> -> echoes check-run id
+          create_check() { # <gate> <sha> <attempt> -> echoes check-run id
             jq -n --arg n "$1" --arg sha "$2" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  --arg ext "attempt-$3" \
               '{name:$n, head_sha:$sha, status:"in_progress", started_at:$t,
-                output:{title:("relay: "+$n), summary:"gate running"}}' \
+                external_id:$ext, output:{title:("relay: "+$n), summary:"gate running"}}' \
               | gh api --method POST "repos/$APP_REPO/check-runs" --input - --jq .id
           }
           finish_check() { # <gate> <conclusion> <summary-text>
@@ -136,41 +137,44 @@ jobs:
           if [ "$FORCE" = "0" ] && [ "$(complete_p "$pr_json")" = "complete" ]; then
             echo "skip=1" >> "$GITHUB_OUTPUT"; echo "verdicts already complete (use force to re-run)"; exit 0
           fi
-          # overlap guard (no concurrency group): if another run is
-          # mid-flight on this same SHA, yield — double-running the suite burns
-          # ~25 min of runner time and interleaves duplicate check runs. A check run
-          # in_progress older than 80 min (> 75-min job timeout + margin) is a
-          # zombie from a dead run: treat as absent so the poll self-heals it.
+          # Overlap + attempt census, one fetch. A check run created with a
+          # name this app already used on this SHA SUPERSEDES the previous
+          # instance (the registry holds at most one instance per name —
+          # verified empirically), so attempts cannot be counted from
+          # instances; the attempt counter rides in external_id
+          # ("attempt-N"), rewritten by every pre-registration wave.
           CUTOFF=$(date -u -d "-${ZOMBIE_CUTOFF_MIN} minutes" +%s)
-          LIVE=$(gh api --paginate "repos/$APP_REPO/commits/$SHA/check-runs" \
+          CENSUS="$(gh api --paginate "repos/$APP_REPO/commits/$SHA/check-runs" \
             | jq -sr --arg slug "$APP_SLUG" --argjson cutoff "$CUTOFF" \
-                '[.[] | .check_runs[]? // empty
-                  | select(.app.slug == $slug and .status == "in_progress")
-                  | select((.started_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) > $cutoff)]
-                 | length')
+                '[.[] | .check_runs[]? // empty | select(.app.slug == $slug)] as $all
+                 | {live: ([$all[] | select(.status == "in_progress")
+                            | select((.started_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) > $cutoff)]
+                           | length),
+                    attempt: ([$all[] | .external_id // empty
+                               | scan("attempt-([0-9]+)") | .[0] | tonumber] | max // 0),
+                    stale: ([$all[] | select(.status == "in_progress")
+                             | select((.started_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) <= $cutoff)
+                             | "\(.id)\t\(.name)"])}')"
+          # overlap guard (no concurrency group): if another run is mid-flight
+          # on this same SHA, yield — double-running the suite burns ~25 min
+          # of runner time. A check run in_progress older than the cutoff
+          # (> 75-min job timeout + margin) is a zombie from a dead run:
+          # treat as absent so the poll self-heals it.
+          LIVE="$(printf '%s' "$CENSUS" | jq -r .live)"
           if [ "$FORCE" != "1" ] && [ "$LIVE" -gt 0 ]; then
             echo "skip=1" >> "$GITHUB_OUTPUT"; echo "another relay run is mid-flight on $SHA, yielding"; exit 0
           fi
 
-          # Quarantine guard: every dead attempt leaves stale in_progress
-          # instances on the gate names it never concluded (dead attempts are
-          # all a selected SHA has ever run — a concluded attempt would have
-          # completed it). Past ATTEMPT_CAP dead attempts, conclude them as
-          # failure instead of taking over again: the head turns red (visible,
-          # consumer-routable), leaves the poll queue, and later PRs stop
-          # starving behind it. Partial PATCH failures retry idempotently on
-          # the next fire; this branch never falls through to a takeover.
-          # Force bypasses, same as dedup and the overlap guard above.
-          CENSUS="$(gh api --paginate "repos/$APP_REPO/commits/$SHA/check-runs" \
-            | jq -sr --arg slug "$APP_SLUG" --argjson cutoff "$CUTOFF" \
-                '[.[] | .check_runs[]? // empty
-                  | select(.app.slug == $slug and .status == "in_progress")
-                  | select((.started_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) <= $cutoff)] as $z
-                 | {zmax: ([$z | group_by(.name)[] | length] | max // 0),
-                    stale: [$z[] | "\(.id)\t\(.name)"]}')"
-          ZMAX="$(printf '%s' "$CENSUS" | jq -r .zmax)"
-          if [ "$FORCE" != "1" ] && [ "$ZMAX" -ge "$ATTEMPT_CAP" ]; then
-            qsum="gate did not conclude after $ZMAX runner attempts (job time limit exceeded) — infrastructure timeout, not a code verdict. Push a new commit or re-run with a force dispatch to retry."
+          # Quarantine guard: past ATTEMPT_CAP dead attempts on one head SHA,
+          # conclude the stale check runs as failure instead of taking over
+          # again — the head turns red (visible, consumer-routable), leaves
+          # the poll queue, and later PRs stop starving behind it. Partial
+          # PATCH failures retry idempotently on the next fire (stale ids
+          # leave the set once concluded); this branch never falls through to
+          # a takeover. Force bypasses, same as dedup and the overlap guard.
+          ATTEMPT="$(printf '%s' "$CENSUS" | jq -r .attempt)"
+          if [ "$FORCE" != "1" ] && [ "$ATTEMPT" -ge "$ATTEMPT_CAP" ]; then
+            qsum="gate did not conclude after $ATTEMPT runner attempts (job time limit exceeded) — infrastructure timeout, not a code verdict. Push a new commit or re-run with a force dispatch to retry."
             patched=0; patchfail=0
             while IFS=$'\t' read -r zid zname; do
               [ -n "$zid" ] || continue
@@ -182,28 +186,12 @@ jobs:
               else
                 patchfail=$((patchfail+1))
               fi
-            done < <(printf '%s\n' "$(printf '%s' "$CENSUS" | jq -r '.stale[]')")
-            # Gate names with ZERO instances on this SHA (interrupted
-            # pre-registration) can never be concluded by PATCHing — create
-            # them concluded so completeness is reachable at all. Duplicate
-            # creates under a concurrent cap race are cosmetic (same
-            # conclusion).
-            created=0
-            names_all="$(gh api --paginate "repos/$APP_REPO/commits/$SHA/check-runs" \
-              | jq -sr --arg slug "$APP_SLUG" '[.[] | .check_runs[]? // empty | select(.app.slug == $slug) | .name] | unique | .[]')"
-            for g in $GATES; do
-              if grep -qxF "$g" <<<"$names_all"; then continue; fi
-              if jq -n --arg n "$g" --arg sha "$SHA" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg s "$qsum" \
-                   '{name:$n, head_sha:$sha, status:"completed", conclusion:"failure",
-                     started_at:$t, completed_at:$t, output:{title:("relay: "+$n), summary:$s}}' \
-                 | gh api --method POST "repos/$APP_REPO/check-runs" --input - >/dev/null 2>&1; then
-                created=$((created+1))
-              fi
-            done
-            echo "quarantined $SHA after $ZMAX dead attempts: $patched concluded, $created created, $patchfail patch failures"
+            done < <(printf '%s' "$CENSUS" | jq -r '.stale[]')
+            echo "quarantined $SHA after $ATTEMPT dead attempts: $patched concluded, $patchfail patch failures"
             echo "skip=1" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          NEXT_ATTEMPT=$((ATTEMPT + 1))
 
           NUMBER="$(printf '%s' "$pr_json" | jq -r .number)"
           BASE_REF="$(printf '%s' "$pr_json" | jq -r .base.ref)"
@@ -229,10 +217,10 @@ jobs:
           : > "$STATE_DIR/results.env"
           : > "$STATE_DIR/checks.tsv"
           for g in $GATES; do
-            id="$(create_check "$g" "$SHA")"
+            id="$(create_check "$g" "$SHA" "$NEXT_ATTEMPT")"
             printf '%s\t%s\n' "$g" "$id" >> "$STATE_DIR/checks.tsv"
           done
-          echo "pre-registered 8 in_progress check runs on $SHA (PR #$NUMBER, base $BASE_REF)"
+          echo "pre-registered 8 in_progress check runs on $SHA (attempt $NEXT_ATTEMPT, PR #$NUMBER, base $BASE_REF)"
           # fail-closed: if the job dies mid-run, un-concluded gates stay
           # pending -> downstream consumers park instead of reading a false green.
 
