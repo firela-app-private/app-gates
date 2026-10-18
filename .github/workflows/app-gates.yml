@@ -510,6 +510,8 @@ jobs:
         if: steps.select.outputs.skip != '1'
         env:
           GH_TOKEN: ${{ steps.tok.outputs.token }}
+          # full error details: this output goes to the PRIVATE check-run summary (ops#328 carve)
+          ERROR_DETAIL: 'full'
         run: |
           source "$RUNNER_TEMP/relay/relay-lib.sh"
           rc=0
@@ -518,22 +520,38 @@ jobs:
           status=0
           flutter test --coverage --reporter=json > test-results.json || status=$?
           python3 - <<'PYEOF'
-          import json
-          names, failed, done = {}, [], 0
+          # KEEP IN SYNC with the twin summarizer block (ops#348: main-test.yml / app-gates.yml gate pr-test)
+          import json, os
+          names, failed, done, errors = {}, [], 0, []
+          done_ok, truncated = None, 0
           for line in open('test-results.json'):
               try:
                   e = json.loads(line)
               except json.JSONDecodeError:
-                  continue  # truncated tail if flutter crashed mid-stream
-              if e.get('type') == 'testStart':
+                  truncated += 1  # truncated tail if flutter crashed mid-stream
+                  continue
+              t = e.get('type')
+              if t == 'testStart':
                   names[e['test']['id']] = e['test']['name']
-              elif e.get('type') == 'testDone':
+              elif t == 'testDone':
                   done += 1
                   if e.get('result') == 'failure':
                       failed.append(names.get(e['testID'], e['testID']))
-          print(f"{done} tests, {len(failed)} failed")
+              elif t == 'error':
+                  if e.get('isFailure'):
+                      continue  # assertion companion: its diff already rides the FAIL line
+                  msg = str(e.get('error') or e.get('message') or 'unknown error')
+                  errors.append(' '.join(msg.split())[:200])
+              elif t == 'done':
+                  done_ok = e.get('success')
+          print(f"{done} tests, {len(failed)} failed, {len(errors)} error events, done.success={done_ok}, truncated={truncated}")
           for n in failed:
               print(f"  FAIL {n}")
+          if os.environ.get('ERROR_DETAIL', 'count') == 'full':
+              for m in errors[:10]:
+                  print(f"  ERROR {m}")
+              if len(errors) > 10:
+                  print(f"  ... and {len(errors) - 10} more error events")
           PYEOF
           exit $status
           ) > "$RUNNER_TEMP/relay/pr-test.log" 2>&1 || rc=$?
