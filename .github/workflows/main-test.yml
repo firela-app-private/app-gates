@@ -1,0 +1,110 @@
+name: main-test
+
+# Post-merge born-red leg (ops#344, adjudicated from app-private#812): run the
+# full flutter test suite on the app repo's main HEAD. The squashed main tree
+# is otherwise never run by any gate — PR gates only see PR trees, so two
+# individually-green PRs landing apart can produce a contradictory (born-red)
+# main tree that surfaces only via a manual local run (observed 2026-10-18:
+# ~2h09m silent red window after #808/#784).
+#
+# Trigger topology — a workflow only hears its OWN repo's events, and fire-la
+# org Actions are disabled (ops#328), so the app repo's main pushes cannot
+# reach this repo in any form. App-main movement is detected by the agent-ops
+# Mac kicker (relay-gates-kick.sh main-HEAD probe, 15-min cadence →
+# workflow_dispatch with the pinned sha). The push trigger below fires on THIS
+# repo's main only (i.e. edits to this workflow) = self-test of the leg. The
+# daily schedule is a Mac-down backstop.
+#
+# Visibility: step failure fails the job — red shows in
+# `gh run list -R firela-app-private/app-gates`. No check runs are posted and
+# nothing in the PR gate path (app-gates.yml) or mergegate changes.
+# Quota: public repo → standard runner minutes free (ops#328).
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'App repo commit SHA to test (blank = current main HEAD; used for red-tree replay evidence)'
+        required: false
+        default: ''
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * *' # daily backstop, off-peak minute
+
+# Unlike app-gates.yml (deliberately group-less for backlog draining), this
+# leg collapses rapid successive main moves to the newest tree: a run started
+# for an older SHA is cancelled when a newer dispatch arrives.
+concurrency:
+  group: main-test
+  cancel-in-progress: true
+
+permissions: {} # egress auth is App-token, minted below
+
+env:
+  APP_REPO: fire-la/firela-app-private
+  FLUTTER_VERSION: '3.44.8' # keep in sync with app-gates.yml
+
+jobs:
+  main-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40 # pr-test alone ~10-25 min on 2 vCPU (app-gates.yml note)
+    steps:
+      - name: Mint app token (fire-la/firela-app-private, contents:read)
+        id: tok
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: fire-la
+          repositories: firela-app-private
+          permission-contents: read
+
+      - name: Checkout app main (or pinned sha)
+        uses: actions/checkout@v4
+        env:
+          # env indirection, not direct interpolation (dispatch inputs never
+          # belong inlined in action params; same pattern as app-gates.yml's
+          # PR_IN). Blank (push/schedule events, blank dispatch) = current
+          # main HEAD at run time; pinned sha = red-tree replay (ops#344
+          # acceptance 5) without touching main.
+          PINNED_SHA: ${{ inputs.sha }}
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.PINNED_SHA || 'main' }}
+          token: ${{ steps.tok.outputs.token }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      # relay-pr-test harness verbatim (minus check-run posting): job red =
+      # main tree red, visible via gh run list.
+      - name: Full flutter test
+        run: |
+          set -euo pipefail
+          flutter pub get
+          status=0
+          flutter test --coverage --reporter=json > test-results.json || status=$?
+          python3 - <<'PYEOF'
+          import json
+          names, failed, done = {}, [], 0
+          for line in open('test-results.json'):
+              try:
+                  e = json.loads(line)
+              except json.JSONDecodeError:
+                  continue  # truncated tail if flutter crashed mid-stream
+              if e.get('type') == 'testStart':
+                  names[e['test']['id']] = e['test']['name']
+              elif e.get('type') == 'testDone':
+                  done += 1
+                  if e.get('result') == 'failure':
+                      failed.append(names.get(e['testID'], e['testID']))
+          print(f"{done} tests, {len(failed)} failed")
+          for n in failed:
+              print(f"  FAIL {n}")
+          PYEOF
+          exit $status
