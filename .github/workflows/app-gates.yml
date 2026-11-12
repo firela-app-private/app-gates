@@ -98,7 +98,11 @@ jobs:
           }
           finish_check() { # <gate> <conclusion> <summary-text>
             local id; id="$(id_of "$1")"
-            local sum; sum="$(printf '%s' "$3" | head -c 50000 | head -40)"
+            # ops#444: keep the END of the log — leg sentinels ("Formatted N
+            # files", analyzer verdict, FAIL lines) live at the tail; the old
+            # head -40 showed only pub-get noise and made pass/fail summaries
+            # indistinguishable.
+            local sum; sum="$(printf '%s' "$3" | tail -c 50000 | tail -n 40)"
             jq -n --arg c "$2" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg title "$1" --arg sum "$sum" \
               '{status:"completed", conclusion:$c, completed_at:$t,
                 output:{title:$title, summary:$sum}}' \
@@ -241,9 +245,11 @@ jobs:
         if: steps.select.outputs.skip != '1'
         env:
           BASE_REF: ${{ steps.select.outputs.base }}
+          HEAD_SHA: ${{ steps.select.outputs.sha }}
         run: |
           set -euo pipefail
           : "${BASE_REF:?select.outputs.base is empty}"
+          : "${HEAD_SHA:?select.outputs.sha is empty}"
           # refs/pull/N/merge is only rebuilt on PR pushes: old PRs carry a
           # stale merge tree judged against an outdated base (e.g. the a11y
           # baseline debt registry living on main). Merging the current base
@@ -273,6 +279,18 @@ jobs:
             # current base's registry now. Loud on failure (file missing from
             # base would leave the phantom-red condition silently in place).
             git checkout "origin/$BASE_REF" -- .github/a11y-gesture-detector-baseline.txt
+          fi
+          # ops#444 acceptance 1: head-side freshness — the gated tree must
+          # contain the selected head SHA. A stale refs/pull/N/merge checkout
+          # would gate old bytes and post verdicts for commits it never saw;
+          # the base-side ff above fixes a stale BASE, this guards the head
+          # side. exit 1 (not concluding the checks) leaves them pending —
+          # same fail-closed shape as tree-not-clean above: the poll retakes
+          # after the merge ref rebuilds, and ATTEMPT_CAP quarantine
+          # escalates if it never does.
+          if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then
+            echo "::error::gated tree $(git rev-parse HEAD) does not contain selected head $HEAD_SHA — refusing to gate wrong bytes"
+            exit 1
           fi
 
       # ---- fast gates (no SDK) ------------------------------------------------
@@ -598,6 +616,7 @@ jobs:
         run: |
           source "$RUNNER_TEMP/relay/relay-lib.sh"
           rc=0
+          N_FILES=$(git ls-files "*.dart" | wc -l | tr -d '[:space:]')
           (
           set -euo pipefail
           ref="$(sed -n '/^  firela_api:/,/^  [a-z]/p' pubspec.yaml | sed -n 's/^ *ref: *//p' | head -1)"
@@ -607,7 +626,17 @@ jobs:
           fi
           echo "firela_api pin OK: ${ref:0:12}…"
           flutter pub get
-          dart format --output=none --set-exit-if-changed $(git ls-files "*.dart")
+          # ops#444: language pin + sentinel checks are an intentional divergence
+          # from the mirrored pr_test.yml "Check formatting" — keep the hardening
+          # when re-syncing this shell from source. The formatter's verdict is
+          # language-version dependent (short vs tall style); pinning the root
+          # package's resolved version judges the same predicate the app repo's
+          # own in-repo `dart format` would, independent of ambient package-config
+          # discovery on the runner.
+          LANGV="$(jq -r '.packages[] | select(.rootUri=="../") | .languageVersion' .dart_tool/package_config.json)"
+          [ -n "$LANGV" ] || { echo "::error::cannot resolve root package language version — refusing ambient resolution"; exit 1; }
+          echo "formatter language pinned: $LANGV"
+          dart format --output=none --set-exit-if-changed --language-version="$LANGV" $(git ls-files "*.dart")
           flutter analyze --fatal-infos
           matches=$(grep -rn --include="*.md" "package:firela/" . \
               | grep -vE "package:firela_(app|api)/" \
@@ -619,7 +648,25 @@ jobs:
             exit 1
           fi
           ) > "$RUNNER_TEMP/relay/pr-analyze.log" 2>&1 || rc=$?
-          finish_check relay-pr-analyze "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/pr-analyze.log" | tail -c 20000)"
+          # ops#444 acceptance 2: a green verdict is only creditable when the log
+          # carries the leg sentinels — the formatter processed exactly the
+          # tracked file set with zero changes AND the analyzer produced a
+          # verdict. Anything else (silent skip, dropped args, truncated
+          # attempt) must not conclude success.
+          if [ "$rc" -eq 0 ] && ! { grep -qE "^Formatted ${N_FILES} files? \(0 changed\)" "$RUNNER_TEMP/relay/pr-analyze.log" \
+                                     && grep -q "No issues found" "$RUNNER_TEMP/relay/pr-analyze.log"; }; then
+            # hard-exit after posting: never fall through to the normal
+            # finish_check below — a second PATCH on the same check id would
+            # overwrite this failure with success.
+            finish_check relay-pr-analyze failure "verdict evidence missing (expected 'Formatted ${N_FILES} files (0 changed)' and analyzer verdict in log) — attempt not creditable without leg evidence (ops#444)"
+            record_rc pr_analyze 1; exit 0
+          fi
+          # ops#444: compose the summary with a sentinel header — on these
+          # runners flutter analyze re-runs a full `pub get` before analyzing,
+          # burying the "Formatted N files" line ~150 lines deep; the tail alone
+          # would only ever show the second pub get + analyzer verdict.
+          PRSUM="$({ grep -E '^(formatter language pinned|Formatted )' "$RUNNER_TEMP/relay/pr-analyze.log" || true; } ; tail -n 36 "$RUNNER_TEMP/relay/pr-analyze.log")"
+          finish_check relay-pr-analyze "$( [ $rc -eq 0 ] && echo success || echo failure )" "$PRSUM"
           record_rc pr_analyze "$rc"; exit 0
 
       - name: gate analyze-sanitizer
@@ -685,7 +732,12 @@ jobs:
           PYEOF
           exit $status
           ) > "$RUNNER_TEMP/relay/pr-test.log" 2>&1 || rc=$?
-          finish_check relay-pr-test "$( [ $rc -eq 0 ] && echo success || echo failure )" "$(cat "$RUNNER_TEMP/relay/pr-test.log" | tail -c 20000)"
+          # ops#444: line 1 is the summarizer's machine counts (N tests, M
+          # failed, done.success) — keep it plus the tail so big FAIL lists
+          # can't push the only verdict-evidence line out of the summary.
+          summary="$(head -n 1 "$RUNNER_TEMP/relay/pr-test.log"; tail -n 39 "$RUNNER_TEMP/relay/pr-test.log")"
+          [ -n "$summary" ] || summary="pr-test log empty — leg crashed before any output (ops#444)"
+          finish_check relay-pr-test "$( [ $rc -eq 0 ] && echo success || echo failure )" "$summary"
           record_rc pr_test "$rc"; exit 0
 
       # ---- forwarder leg (poll-based port of forward-parser-request.yml) ------
